@@ -78,16 +78,19 @@ PKGVER="${TAG_NAME#v}"
 echo "Latest Tag    : $TAG_NAME"
 echo "Parsed Version: $PKGVER"
 
+echo "==> 2. Updating latest.txt..."
+date -u -Iseconds > latest.txt
+
 # Check if already up to date
 if [ -f "$VERSION_FILE" ] && [ "$(cat "$VERSION_FILE")" = "$PKGVER" ]; then
   echo "==> Package is already up to date ($PKGVER). Exiting."
   exit 0
 fi
 
-echo "==> 2. Updating version.txt..."
+echo "==> 3. Updating version.txt..."
 echo "$PKGVER" > "$VERSION_FILE"
 
-echo "==> 3. Prefetching git source with submodules to compute SRI hash..."
+echo "==> 4. Prefetching git source with submodules to compute SRI hash..."
 GIT_REPO="https://github.com/$REPO_OWNER/$REPO_NAME"
 
 PREFETCH_OUTPUT=$(nix-prefetch-git \
@@ -105,7 +108,7 @@ fi
 
 echo "SRI Hash: $SRI_HASH"
 
-echo "==> 4. Updating $NIX_FILE..."
+echo "==> 5. Updating $NIX_FILE..."
 python3 -c "
 import re
 
@@ -129,8 +132,5 @@ content = re.sub(
 with open('$NIX_FILE', 'w') as f:
     f.write(content)
 "
-
-echo "==> 5. Updating latest.txt..."
-date -u -Iseconds > latest.txt
 
 echo "==> Successfully updated $NIX_FILE to version $PKGVER!"
