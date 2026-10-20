@@ -53,7 +53,7 @@
 
         preFixup = ''
           makeWrapperArgs+=("''${gappsWrapperArgs[@]}")
-          makeWrapperArgs+=(--prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libGL ]})
+          makeWrapperArgs+=(--prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libglvnd ]})
         '';
 
         meta = {
