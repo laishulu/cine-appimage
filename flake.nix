@@ -79,7 +79,7 @@
         hash = "sha256-lcvnzOlxf86QxITjQFLufH8ddjWzPBJSW0d2gmp9KbY=";
       };
 
-      # 4. AppDir sanitization and ELF patching script (never run patchelf on ld-linux itself)
+      # 4. AppDir sanitization and ELF patching script
       patchAppDirPy = pkgs.writeText "patch-appdir.py" ''
         import os, glob, re, subprocess
 
@@ -137,13 +137,13 @@
           pythonEnv
         ];
 
+        # Omitted pkgs.glibcLocales to save 230+ MB
         closureInfo = pkgs.closureInfo {
           rootPaths = [
             cinePkg
             pythonEnv
             rawPython
             pkgs.glibc
-            pkgs.glibcLocales
             pkgs.gtk4.out
             pkgs.libadwaita.out
             pkgs.graphene.out
@@ -174,9 +174,9 @@
         installPhase = ''
           runHook preInstall
 
-          mkdir -p AppDir/usr/{bin,lib,share/locale,lib/girepository-1.0,lib/locale}
+          mkdir -p AppDir/usr/{bin,lib,share/locale,lib/girepository-1.0}
 
-          # 1. Copy application assets, translations, and locale environment
+          # 1. Copy application assets and translations
           cp -rL --no-preserve=mode "${cinePkg}/share/"* AppDir/usr/share/
           [ -d "${cinePkg}/lib" ] && cp -rL --no-preserve=mode "${cinePkg}/lib/"* AppDir/usr/lib/
 
@@ -184,13 +184,11 @@
             [ -d "$p/share/locale" ] && cp -rL --no-preserve=mode "$p/share/locale/"* AppDir/usr/share/locale/
           done
 
+          # Setup symlinks for Chinese locale naming compatibility
           [ -d AppDir/usr/share/locale/zh_Hans ] && [ ! -d AppDir/usr/share/locale/zh_CN ] && ln -sf zh_Hans AppDir/usr/share/locale/zh_CN
           [ -d AppDir/usr/share/locale/zh_CN ] && [ ! -d AppDir/usr/share/locale/zh_Hans ] && ln -sf zh_CN AppDir/usr/share/locale/zh_Hans
 
-          # Copy matching glibcLocales archive to prevent locale fallback
-          cp -fL --no-preserve=mode "${pkgs.glibcLocales}/lib/locale/locale-archive" AppDir/usr/lib/locale/locale-archive
-
-          # Critical: bundle matching glibc runtime and the ld-linux dynamic linker
+          # Bundle matching glibc runtime and the ld-linux dynamic linker
           cp -fL --no-preserve=mode ${pkgs.glibc}/lib/*.so* AppDir/usr/lib/ 2>/dev/null || true
           if [ -d "${pkgs.glibc}/lib/gconv" ]; then
             cp -rL --no-preserve=mode "${pkgs.glibc}/lib/gconv" AppDir/usr/lib/ 2>/dev/null || true
@@ -326,7 +324,7 @@ sys.exit(main.main("${cinePkg.version}"))
 EOF
           chmod +x AppDir/usr/bin/cine-entry
 
-          # 8. Generate AppRun entry point (invoking python3 via bundled ld-linux)
+          # 8. Generate AppRun entry point (Plan B: dynamic host locale detection)
           cat << 'EOF' > AppDir/AppRun
 #!/usr/bin/env bash
 set -e
@@ -335,8 +333,20 @@ export APPDIR="''${APPDIR:-$(dirname "$(readlink -f "''${BASH_SOURCE[0]}")")}"
 export PATH="$APPDIR/usr/bin:$PATH"
 export PYTHONNOUSERSITE=true
 
-unset LOCPATH
-export LOCALE_ARCHIVE="$APPDIR/usr/lib/locale/locale-archive"
+# Plan B: Try host locale-archive first, otherwise fall back to host locale directories
+if [ -z "$LOCALE_ARCHIVE" ]; then
+  if [ -f "/usr/lib/locale/locale-archive" ]; then
+    export LOCALE_ARCHIVE="/usr/lib/locale/locale-archive"
+  elif [ -f "/run/current-system/sw/lib/locale/locale-archive" ]; then
+    export LOCALE_ARCHIVE="/run/current-system/sw/lib/locale/locale-archive"
+  fi
+fi
+
+# Fallback for systems with individual locale directories (e.g., Debian/Ubuntu)
+if [ -d "/usr/lib/locale" ]; then
+  export LOCPATH="/usr/lib/locale''${LOCPATH:+:$LOCPATH}"
+fi
+
 [ -d "$APPDIR/usr/lib/gconv" ] && export GCONV_PATH="$APPDIR/usr/lib/gconv"
 
 if [ -n "$LANG" ]; then
