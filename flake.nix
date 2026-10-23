@@ -1,5 +1,5 @@
 {
-  description = "Cine Video Player Standalone AppImage Build Configuration";
+  description = "Cine Video Player Standalone FHS AppImage Build Configuration";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/7fd4004d0511991fff3a0524856a9be09e28c5f0";
@@ -8,11 +8,18 @@
   outputs = { self, nixpkgs }:
     let
       system = "x86_64-linux";
-      pkgs = import nixpkgs {
-        inherit system;
-      };
+      pkgs = import nixpkgs { inherit system; };
 
-      # 1. Native Cine package derivation
+      # 1. Bundled Python environment with runtime modules
+      pythonEnv = pkgs.python3.withPackages (ps: with ps; [
+        pygobject3
+        mpv
+      ]);
+
+      # Raw unwrapped Python package (direct binary, bypassing makeCWrapper)
+      rawPython = pythonEnv.passthru.python;
+
+      # 2. Native Cine application package definition
       cinePkg = pkgs.python3Packages.buildPythonApplication (finalAttrs: {
         pname = "cine";
         version = "1.8.6";
@@ -33,6 +40,7 @@
           ninja
           cmake
           pkg-config
+          gettext # Required: provides msgfmt to compile .mo translation files
           wrapGAppsHook4
           blueprint-compiler
           desktop-file-utils
@@ -40,10 +48,10 @@
         ];
 
         buildInputs = with pkgs; [
-          gettext
           glib
           gtk4
           libadwaita
+          graphene
         ];
 
         dependencies = with pkgs.python3Packages; [
@@ -51,268 +59,351 @@
           mpv
         ];
 
-        # Inject runtime libraries into the wrapper script
-        preFixup = ''
-          makeWrapperArgs+=("''${gappsWrapperArgs[@]}")
-          makeWrapperArgs+=(
-            --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libglvnd pkgs.mesa pkgs.libva ]}
-            --set-default LIBVA_DRIVERS_PATH "${pkgs.intel-media-driver}/lib/dri:${pkgs.intel-vaapi-driver}/lib/dri:${pkgs.mesa}/lib/dri"
-            --set-default LIBGL_DRIVERS_PATH "${pkgs.mesa}/lib/dri"
-            --set-default ALSA_CONFIG_PATH "${pkgs.alsa-lib}/share/alsa/alsa.conf"
-          )
-        '';
-
-        meta = {
+        meta = with pkgs.lib; {
           description = "Video Player for Linux";
           homepage = "https://github.com/diegopvlk/Cine";
-          license = pkgs.lib.licenses.gpl3Plus;
-          maintainers = with pkgs.lib.maintainers; [ ];
+          license = licenses.gpl3Plus;
           mainProgram = "cine";
-          platforms = pkgs.lib.platforms.linux;
+          platforms = platforms.linux;
         };
       });
 
-      # 2. Upstream Type 2 AppImage runtime binary
+      # 3. Upstream Type 2 AppImage runtime and packaging tool
       appimageRuntime = pkgs.fetchurl {
-        url = "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64";
-        hash = "sha256-FW9L296cUtAYFGAAE+Cic/ARjcLemJdfPIxjQn7HkHQ=";
+        url = "https://github.com/AppImage/type2-runtime/releases/latest/download/runtime-x86_64";
+        hash = "sha256-YXqncxTVfIuOT66cPws1r3sw1VKctp6Y9k+SUQ7ZikY=";
       };
 
-      # 3. Static PRoot binary used as a fallback when unprivileged bubblewrap is unavailable
-      prootStatic = pkgs.fetchurl {
-        url = "https://github.com/proot-me/proot/releases/download/v5.5.0/proot";
-        hash = "sha256-2xhTAKnaq7zoasp2MtjH/cQkn28VMXGVQBO3DF9JHsA=";
+      appimagetool = pkgs.fetchurl {
+        url = "https://github.com/AppImage/appimagetool/releases/latest/download/appimagetool-x86_64.AppImage";
+        hash = "sha256-lcvnzOlxf86QxITjQFLufH8ddjWzPBJSW0d2gmp9KbY=";
       };
 
-      # 4. Standalone AppImage construction
-      appimage = pkgs.stdenv.mkDerivation {
-        name = "Cine-${cinePkg.version}-x86_64.AppImage";
+      # 4. AppDir sanitization and ELF patching script (never run patchelf on ld-linux itself)
+      patchAppDirPy = pkgs.writeText "patch-appdir.py" ''
+        import os, glob, re, subprocess
+
+        # (a) Strip absolute /nix/store paths from .typelib files
+        pattern = re.compile(rb"(/nix/store/[^\x00]+)")
+        for path in glob.glob("AppDir/usr/lib/girepository-1.0/*.typelib"):
+            with open(path, "rb") as f:
+                data = f.read()
+            new_data = pattern.sub(lambda m: b",".join(p.split(b"/")[-1] for p in m.group(0).split(b",")).ljust(len(m.group(0)), b"\x00"), data)
+            if new_data != data:
+                with open(path, "wb") as f:
+                    f.write(new_data)
+
+        # (b) Scan and patch all ELF binaries across AppDir
+        common_rpath = "$ORIGIN:$ORIGIN/..:$ORIGIN/pulseaudio:$ORIGIN/../lib:$ORIGIN/../../..:$ORIGIN/../../../..:$ORIGIN/../../../../lib"
+        for root_dir in ["AppDir/usr"]:
+            for dirpath, _, filenames in os.walk(root_dir):
+                for fname in filenames:
+                    # Never run patchelf on the dynamic linker itself
+                    if fname.startswith("ld-linux") or fname.startswith("ld-2."):
+                        continue
+                    fpath = os.path.join(dirpath, fname)
+                    if os.path.islink(fpath) or not os.path.isfile(fpath):
+                        continue
+                    try:
+                        with open(fpath, "rb") as f:
+                            if f.read(4) != b"\x7fELF": continue
+                    except Exception:
+                        continue
+
+                    cmd = ["patchelf", "--set-rpath", common_rpath]
+
+                    res = subprocess.run(["patchelf", "--print-needed", fpath], capture_output=True, text=True)
+                    if res.returncode == 0:
+                        for line in res.stdout.splitlines():
+                            line = line.strip()
+                            if line.startswith("/nix/store/"):
+                                cmd.extend(["--replace-needed", line, os.path.basename(line)])
+
+                    cmd.append(fpath)
+                    subprocess.run(cmd, stderr=subprocess.DEVNULL)
+      '';
+
+      # 5. Standalone native FHS AppImage derivation
+      appimage = pkgs.stdenvNoCC.mkDerivation {
+        pname = "cine-appimage";
+        version = cinePkg.version;
 
         nativeBuildInputs = with pkgs; [
-          squashfsTools
-          binutils
-          coreutils
+          patchelf
+          file
           zsync
+          glib.dev
+          gdk-pixbuf
+          pythonEnv
         ];
 
-        # Fully closed dependency graph: Include graphics drivers directly to guarantee VA-API acceleration
         closureInfo = pkgs.closureInfo {
           rootPaths = [
             cinePkg
-            pkgs.mesa
-            pkgs.libva
-            pkgs.intel-media-driver
-            pkgs.intel-vaapi-driver
-            pkgs.alsa-lib
-            pkgs.fontconfig
+            pythonEnv
+            rawPython
+            pkgs.glibc
             pkgs.glibcLocales
+            pkgs.gtk4.out
+            pkgs.libadwaita.out
+            pkgs.graphene.out
+            pkgs.pango.out
+            pkgs.gdk-pixbuf.out
+            pkgs.cairo.out
+            pkgs.freetype.out
+            pkgs.fontconfig.out
+            pkgs.harfbuzz.out
+            pkgs.fribidi.out
+            pkgs.librsvg.out
+            pkgs.mpv.out
+            pkgs.mesa.out
+            pkgs.libdrm.out
+            pkgs.libva.out
+            pkgs.libglvnd.out
+            pkgs.pulseaudio.out
+            pkgs.shared-mime-info
+            pkgs.gsettings-desktop-schemas
+            pkgs.gobject-introspection
           ];
         };
 
-        buildCommand = ''
-          set -euo pipefail
+        dontUnpack = true;
+        dontPatchELF = true;
+        dontStrip = true;
 
-          mkdir -p AppDir/nix/store
-          while IFS= read -r path; do
-            cp -a "$path" AppDir/nix/store/
+        installPhase = ''
+          runHook preInstall
+
+          mkdir -p AppDir/usr/{bin,lib,share/locale,lib/girepository-1.0,lib/locale}
+
+          # 1. Copy application assets, translations, and locale environment
+          cp -rL --no-preserve=mode "${cinePkg}/share/"* AppDir/usr/share/
+          [ -d "${cinePkg}/lib" ] && cp -rL --no-preserve=mode "${cinePkg}/lib/"* AppDir/usr/lib/
+
+          for p in "${pkgs.gtk4}" "${pkgs.libadwaita}"; do
+            [ -d "$p/share/locale" ] && cp -rL --no-preserve=mode "$p/share/locale/"* AppDir/usr/share/locale/
+          done
+
+          [ -d AppDir/usr/share/locale/zh_Hans ] && [ ! -d AppDir/usr/share/locale/zh_CN ] && ln -sf zh_Hans AppDir/usr/share/locale/zh_CN
+          [ -d AppDir/usr/share/locale/zh_CN ] && [ ! -d AppDir/usr/share/locale/zh_Hans ] && ln -sf zh_CN AppDir/usr/share/locale/zh_Hans
+
+          # Copy matching glibcLocales archive to prevent locale fallback
+          cp -fL --no-preserve=mode "${pkgs.glibcLocales}/lib/locale/locale-archive" AppDir/usr/lib/locale/locale-archive
+
+          # Critical: bundle matching glibc runtime and the ld-linux dynamic linker
+          cp -fL --no-preserve=mode ${pkgs.glibc}/lib/*.so* AppDir/usr/lib/ 2>/dev/null || true
+          if [ -d "${pkgs.glibc}/lib/gconv" ]; then
+            cp -rL --no-preserve=mode "${pkgs.glibc}/lib/gconv" AppDir/usr/lib/ 2>/dev/null || true
+          fi
+
+          # Copy the unwrapped raw Python binary
+          REAL_PY=$(readlink -f "${rawPython}/bin/python3")
+          cp -L --no-preserve=mode "$REAL_PY" AppDir/usr/bin/python3
+          chmod +x AppDir/usr/bin/python3
+
+          cp -rL --no-preserve=mode "${pythonEnv}/lib/"* AppDir/usr/lib/ 2>/dev/null || true
+          if [ -d "${rawPython}/lib" ]; then
+            cp -rL --no-preserve=mode "${rawPython}/lib/"* AppDir/usr/lib/ 2>/dev/null || true
+          fi
+
+          find AppDir/usr/lib -type d \( -name "test" -o -name "tests" -o -name "idlelib" -o -name "__pycache__" \) -exec rm -rf {} + 2>/dev/null || true
+          find AppDir/usr/lib -type f -name "*.pyc" -delete 2>/dev/null || true
+
+          # 2. Extract shared libraries and typelibs from the closure
+          while IFS= read -r storePath; do
+            case "$storePath" in
+              *linux-headers*|*llvm*|*intel-media-driver*|*-dev) continue ;;
+              *)
+                if [ -d "$storePath/lib" ]; then
+                  find -L "$storePath/lib" -maxdepth 2 -type f \( -name "*.so" -o -name "*.so.*" \) ! -path "*/dri/*" -exec cp -f --no-preserve=mode -t AppDir/usr/lib/ {} + 2>/dev/null || true
+                fi
+                if [ -d "$storePath/lib/pulseaudio" ]; then
+                  mkdir -p AppDir/usr/lib/pulseaudio
+                  find -L "$storePath/lib/pulseaudio" -type f \( -name "*.so" -o -name "*.so.*" \) -exec cp -f --no-preserve=mode -t AppDir/usr/lib/pulseaudio/ {} + 2>/dev/null || true
+                fi
+                find "$storePath" -type f -name "*.typelib" -exec cp -f --no-preserve=mode -t AppDir/usr/lib/girepository-1.0/ {} + 2>/dev/null || true
+                if [ -d "$storePath/lib/gdk-pixbuf-2.0" ]; then
+                  mkdir -p AppDir/usr/lib/gdk-pixbuf-2.0
+                  cp -rL --no-preserve=mode "$storePath/lib/gdk-pixbuf-2.0/"* AppDir/usr/lib/gdk-pixbuf-2.0/ 2>/dev/null || true
+                fi
+                ;;
+            esac
           done < "$closureInfo/store-paths"
 
-          chmod -R u+w AppDir/nix/store
+          # Create missing short and major version symlinks
+          for sofile in AppDir/usr/lib/*.so.*; do
+            [ -f "$sofile" ] || continue
+            base="$(basename "$sofile")"
+            short_so="''${base%%.so*}.so"
+            major_so="$(echo "$base" | sed -E 's/(\.so\.[0-9]+).*/\1/')"
+            [ ! -e "AppDir/usr/lib/$short_so" ] && ln -sf "$base" "AppDir/usr/lib/$short_so" 2>/dev/null || true
+            [ ! -e "AppDir/usr/lib/$major_so" ] && ln -sf "$base" "AppDir/usr/lib/$major_so" 2>/dev/null || true
+          done
 
-          # Safely remove static libraries and libtool archives without following symlinks
-          find AppDir/nix/store -type f \( -name "*.a" -o -name "*.la" \) -delete 2>/dev/null || true
+          # 3. Run full ELF sanitization and patching
+          python3 ${patchAppDirPy}
+          find AppDir/usr/lib -type f -name "mpv.py" -exec sed -i -E 's|"/nix/store/[^"]+/libmpv\.so"|"libmpv.so"|g' {} + 2>/dev/null || true
 
-          # Bundle static bubblewrap and static proot
-          cp ${pkgs.pkgsStatic.bubblewrap}/bin/bwrap AppDir/bwrap
-          chmod +x AppDir/bwrap
-
-          cp ${prootStatic} AppDir/proot
-          chmod +x AppDir/proot
-
-          # Copy shared assets for desktop integration
-          mkdir -p AppDir/usr/share
-          if [ -d "${cinePkg}/share" ]; then
-            cp -r "${cinePkg}/share/"* AppDir/usr/share/
+          # 4. Configure GDK-Pixbuf loaders and cache
+          PIXBUF_LOADERS_DIR=$(find AppDir/usr/lib/gdk-pixbuf-2.0 -type d -name "loaders" 2>/dev/null | head -n 1 || true)
+          if [ -n "$PIXBUF_LOADERS_DIR" ]; then
+            mkdir -p AppDir/usr/lib/gdk-pixbuf-2.0/2.10.0
+            gdk-pixbuf-query-loaders $(find "$PIXBUF_LOADERS_DIR" -name "*.so") > AppDir/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/dev/null || true
+            sed -i "s|$PWD/AppDir/usr/|../|g" AppDir/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/dev/null || true
           fi
 
-          # Symlink desktop file to AppDir root
+          # 5. Consolidate and compile GSettings schemas
+          mkdir -p AppDir/usr/share/glib-2.0/schemas
+          find "${cinePkg}" -name "*.gschema.xml" -exec cp -t AppDir/usr/share/glib-2.0/schemas/ {} + 2>/dev/null || true
+          for pkg in "${pkgs.gtk4}" "${pkgs.libadwaita}" "${pkgs.gsettings-desktop-schemas}"; do
+            [ -d "$pkg/share/glib-2.0/schemas" ] && cp -d "$pkg"/share/glib-2.0/schemas/*.xml AppDir/usr/share/glib-2.0/schemas/ 2>/dev/null || true
+          done
+          chmod -R u+w AppDir/usr/share/glib-2.0/schemas
+          glib-compile-schemas AppDir/usr/share/glib-2.0/schemas
+
+          # 6. Set up desktop entry and application icon symlinks
           DESKTOP_FILE=$(find AppDir/usr/share/applications -name "*.desktop" | head -n 1)
-          if [ -n "$DESKTOP_FILE" ]; then
-            ln -sf "usr/share/applications/$(basename "$DESKTOP_FILE")" AppDir/
-          fi
-
-          # Locate application icon and link it as AppImage icon and .DirIcon
-          ICON_FILE=$(find AppDir/usr/share/icons -name "*cine*.svg" -o -name "*cine*.png" | head -n 1)
+          ln -sf "usr/share/applications/$(basename "$DESKTOP_FILE")" AppDir/
+          ICON_NAME=$(grep -m1 '^Icon=' "$DESKTOP_FILE" | cut -d= -f2)
+          ICON_FILE=$(find AppDir/usr/share/icons \( -name "$ICON_NAME.*" -o -iname "*cine*.svg" \) | head -n 1)
           if [ -n "$ICON_FILE" ]; then
-            ICON_REL_PATH="''${ICON_FILE#AppDir/}"
-            ln -sf "$ICON_REL_PATH" AppDir/
-            ln -sf "$ICON_REL_PATH" AppDir/.DirIcon
+            ln -sf "''${ICON_FILE#AppDir/}" "AppDir/$ICON_NAME.''${ICON_FILE##*.}"
+            ln -sf "''${ICON_FILE#AppDir/}" AppDir/.DirIcon
           fi
 
-          # Standard entrypoint symlinks
-          mkdir -p AppDir/bin
-          ln -s "${cinePkg}/bin/cine" AppDir/bin/cine
-          ln -s "${cinePkg}/bin/cine" AppDir/entrypoint
+          # 7. Generate entry script (pure Python script invoked via bundled ld-linux)
+          cat << 'EOF' > AppDir/usr/bin/cine-entry
+import sys, os, glob, ctypes, locale, gettext
 
-          # Multiplexer script handling bwrap and proot sandboxing
+appdir = os.environ.get("APPDIR", "")
+usr_lib = os.path.join(appdir, "usr", "lib")
+share_dir = os.path.join(appdir, "usr", "share")
+cine_share = os.path.join(share_dir, "cine")
+localedir = os.path.join(share_dir, "locale")
+
+# 1. Initialize and bind C runtime & Python i18n domains
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except Exception:
+    pass
+
+try:
+    libc = ctypes.CDLL(os.path.join(usr_lib, "libc.so.6"))
+    for domain in [b"cine", b"com.github.diegopvlk.Cine", b"gtk40", b"libadwaita"]:
+        libc.bindtextdomain(domain, localedir.encode("utf-8"))
+        libc.bind_textdomain_codeset(domain, b"UTF-8")
+    libc.textdomain(b"cine")
+except Exception:
+    pass
+
+for domain in ["cine", "com.github.diegopvlk.Cine", "gtk40", "libadwaita"]:
+    gettext.bindtextdomain(domain, localedir)
+gettext.textdomain("cine")
+
+# 2. Preload low-level rendering and font libraries
+for lib in ["libgbm.so.1", "libfreetype.so.6", "libharfbuzz.so.0", "libfontconfig.so.1"]:
+    lp = os.path.join(usr_lib, lib)
+    if os.path.exists(lp):
+        try: ctypes.CDLL(lp, mode=ctypes.RTLD_GLOBAL)
+        except Exception: pass
+
+if os.path.isdir(cine_share):
+    sys.path.insert(0, cine_share)
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gio, Gtk, Adw
+
+for res in glob.glob(os.path.join(share_dir, "**", "*.gresource"), recursive=True):
+    try: Gio.Resource.load(res)._register()
+    except Exception: pass
+
+Adw.init()
+
+from cine import main
+sys.exit(main.main("${cinePkg.version}"))
+EOF
+          chmod +x AppDir/usr/bin/cine-entry
+
+          # 8. Generate AppRun entry point (invoking python3 via bundled ld-linux)
           cat << 'EOF' > AppDir/AppRun
-          #!/usr/bin/env bash
-          set -e
+#!/usr/bin/env bash
+set -e
 
-          # 1. Locate mounted AppDir root
-          HERE="$(cd "$(dirname "$(readlink -f "''${BASH_SOURCE[0]}")")" && pwd)"
-          TARGET="${cinePkg}/bin/cine"
+export APPDIR="''${APPDIR:-$(dirname "$(readlink -f "''${BASH_SOURCE[0]}")")}"
+export PATH="$APPDIR/usr/bin:$PATH"
+export PYTHONNOUSERSITE=true
 
-          # 2. Sound server configuration
-          USER_RUNTIME="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-          if [ -z "$PULSE_SERVER" ]; then
-            if [ -S "$USER_RUNTIME/pulse/native" ]; then
-              export PULSE_SERVER="unix:$USER_RUNTIME/pulse/native"
-            elif [ -S "/run/user/$(id -u)/pulse/native" ]; then
-              export PULSE_SERVER="unix:/run/user/$(id -u)/pulse/native"
-            fi
-          fi
+unset LOCPATH
+export LOCALE_ARCHIVE="$APPDIR/usr/lib/locale/locale-archive"
+[ -d "$APPDIR/usr/lib/gconv" ] && export GCONV_PATH="$APPDIR/usr/lib/gconv"
 
-          # Force mpv hardware acceleration and audio output defaults
-          export MPV_OPTS="--hwdec=vaapi,auto --vo=gpu --ao=pulse,alsa ''${MPV_OPTS:-}"
+if [ -n "$LANG" ]; then
+  case "$LANG" in
+    zh_CN*) export LANGUAGE="zh_CN:zh_Hans:zh''${LANGUAGE:+:$LANGUAGE}" ;;
+    zh_TW*|zh_HK*) export LANGUAGE="zh_TW:zh_Hant:zh''${LANGUAGE:+:$LANGUAGE}" ;;
+  esac
+fi
 
-          # 3. Environment configuration: Locales, Fontconfig, ALSA, and Drivers
-          export LOCALE_ARCHIVE="${pkgs.glibcLocales}/lib/locale/locale-archive"
+export TEXTDOMAIN="cine"
+export TEXTDOMAINDIR="$APPDIR/usr/share/locale"
+export GSETTINGS_SCHEMA_DIR="$APPDIR/usr/share/glib-2.0/schemas"
+export XDG_DATA_DIRS="$APPDIR/usr/share:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
-          # Build isolated fontconfig configuration
-          FC_CONF="/tmp/.appimage-fontconfig-$UID.conf"
-          printf '%s\n' \
-            '<?xml version="1.0"?>' \
-            '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">' \
-            '<fontconfig>' \
-            '  <include ignore_missing="no">${pkgs.fontconfig.out}/etc/fonts/fonts.conf</include>' \
-            '  <include ignore_missing="yes">${pkgs.fontconfig.out}/etc/fonts/conf.d</include>' \
-            '  <dir ignore_missing="yes">/usr/share/fonts</dir>' \
-            '  <dir ignore_missing="yes">/usr/local/share/fonts</dir>' \
-            '  <dir ignore_missing="yes">/run/current-system/sw/share/X11/fonts</dir>' \
-            '  <dir ignore_missing="yes">~/.local/share/fonts</dir>' \
-            '  <dir ignore_missing="yes">~/.fonts</dir>' \
-            '</fontconfig>' > "$FC_CONF"
-          export FONTCONFIG_FILE="$FC_CONF"
+# Host GPU driver pass-through
+HOST_DRI="/run/opengl-driver/lib/dri:/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri"
+export LIBVA_DRIVERS_PATH="$HOST_DRI''${LIBVA_DRIVERS_PATH:+:$LIBVA_DRIVERS_PATH}"
+export __EGL_VENDOR_LIBRARY_DIRS="/run/opengl-driver/share/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d:$APPDIR/usr/share/glvnd/egl_vendor.d"
 
-          # Use bundled Intel VA-API and Mesa drivers directly (fully resolved inside AppImage /nix/store)
-          NIX_VA_DRIVERS="${pkgs.intel-media-driver}/lib/dri:${pkgs.intel-vaapi-driver}/lib/dri:${pkgs.mesa}/lib/dri"
-          export LIBVA_DRIVERS_PATH="$NIX_VA_DRIVERS"
-          export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
-          export __EGL_VENDOR_LIBRARY_DIRS="${pkgs.mesa}/share/glvnd/egl_vendor.d"
+[ -d "/etc/fonts" ] && export FONTCONFIG_PATH="/etc/fonts''${FONTCONFIG_PATH:+:$FONTCONFIG_PATH}"
+[ -f "$APPDIR/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" ] && export GDK_PIXBUF_MODULE_FILE="$APPDIR/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
 
-          # 4. Collect common host mount points
-          SHARED_RW_MOUNTS=(
-            /dev
-            /proc
-            /sys
-            /tmp
-            /run
-            /var
-            "$HOME"
-          )
-          for d in /media /mnt /run/media; do
-            [ -d "$d" ] && SHARED_RW_MOUNTS+=("$d")
-          done
+export PYTHONPATH="$APPDIR/usr/share/cine:$APPDIR/usr/lib/${rawPython.libPrefix}/site-packages''${PYTHONPATH:+:$PYTHONPATH}"
+export GI_TYPELIB_PATH="$APPDIR/usr/lib/girepository-1.0"
+export MPV_OPTS="--hwdec=auto-safe --vo=gpu ''${MPV_OPTS:-}"
 
-          # Safe host root mounts: DO NOT blanket-mount all of /etc to prevent broken host alsa/font symlinks
-          SHARED_RO_MOUNTS=()
-          for d in /*; do
-            case "$d" in
-              /proc|/dev|/sys|/tmp|/run|/var|/nix|/home|/root|/etc) ;;
-              *) [ -e "$d" ] && SHARED_RO_MOUNTS+=("$d") ;;
-            esac
-          done
+LOADER="$APPDIR/usr/lib/ld-linux-x86-64.so.2"
+LIB_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/pulseaudio:/run/opengl-driver/lib:/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri"
 
-          # Pass essential host /etc files safely without inheriting broken /etc/alsa symlinks
-          SAFE_ETC_MOUNTS=(
-            /etc/resolv.conf
-            /etc/ssl
-            /etc/pki
-            /etc/ca-certificates
-            /etc/machine-id
-            /etc/localtime
-            /etc/passwd
-            /etc/group
-          )
+# Execute python3 using the bundled dynamic linker to fully decouple from the host glibc
+exec "$LOADER" --library-path "$LIB_PATH" "$APPDIR/usr/bin/python3" "$APPDIR/usr/bin/cine-entry" "$@"
+EOF
 
-          # 5. Check if unprivileged bubblewrap is supported
-          CAN_BWRAP=0
-          if [ -x "$HERE/bwrap" ] && "$HERE/bwrap" --ro-bind / / true >/dev/null 2>&1; then
-            CAN_BWRAP=1
-          fi
+          # Set proper read, write, and execute permissions across AppDir
+          chmod -R u+w AppDir
+          chmod +x AppDir/AppRun AppDir/usr/bin/* AppDir/usr/lib/ld-linux-x86-64.so.2
+          chmod -R a+rX AppDir
 
-          # 6. Dispatch execution: bubblewrap preferred, fallback to proot
-          if [ "$CAN_BWRAP" -eq 1 ]; then
-            BWRAP_ARGS=(
-              --proc /proc
-              --dev-bind /dev /dev
-              --dir /nix
-              --ro-bind "$HERE/nix/store" /nix/store
-            )
+          # 9. Assemble and package final AppImage
+          install -m755 ${appimagetool} ./appimagetool
 
-            for d in "''${SHARED_RW_MOUNTS[@]}"; do
-              [ -e "$d" ] && [ "$d" != "/dev" ] && [ "$d" != "/proc" ] && BWRAP_ARGS+=(--bind-try "$d" "$d")
-            done
-
-            for d in "''${SHARED_RO_MOUNTS[@]}"; do
-              BWRAP_ARGS+=(--ro-bind-try "$d" "$d")
-            done
-
-            for f in "''${SAFE_ETC_MOUNTS[@]}"; do
-              [ -e "$f" ] && BWRAP_ARGS+=(--ro-bind-try "$f" "$f")
-            done
-
-            exec "$HERE/bwrap" "''${BWRAP_ARGS[@]}" -- "$TARGET" "$@"
-          elif [ -x "$HERE/proot" ]; then
-            echo "[Notice] Running via PRoot fallback. Performance in video decoding may degrade." >&2
-
-            PROOT_ARGS=(
-              -r /
-              -b "$HERE/nix/store:/nix/store"
-            )
-
-            for d in "''${SHARED_RW_MOUNTS[@]}"; do
-              [ -e "$d" ] && PROOT_ARGS+=(-b "$d:$d")
-            done
-
-            for d in "''${SHARED_RO_MOUNTS[@]}"; do
-              [ -e "$d" ] && PROOT_ARGS+=(-b "$d:$d")
-            done
-
-            for f in "''${SAFE_ETC_MOUNTS[@]}"; do
-              [ -e "$f" ] && PROOT_ARGS+=(-b "$f:$f")
-            done
-
-            exec "$HERE/proot" "''${PROOT_ARGS[@]}" "$TARGET" "$@"
-          else
-            echo "Error: Neither bwrap nor proot is functional on this system." >&2
-            exit 1
-          fi
-          EOF
-          chmod +x AppDir/AppRun
-
-          # 7. Create compressed SquashFS filesystem
-          mksquashfs AppDir squashfs.img \
-            -root-owned -noappend \
-            -comp zstd -b 1M -Xcompression-level 22
-
-          # 8. Concatenate runtime header and squashfs payload into AppImage binary
           mkdir -p "$out"
           FINAL_APPIMAGE="$out/Cine-${cinePkg.version}-x86_64.AppImage"
-          cat ${appimageRuntime} squashfs.img > "$FINAL_APPIMAGE"
-          chmod +x "$FINAL_APPIMAGE"
 
-          # 9. Generate zsync delta file for differential updates
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
+            --runtime-file "${appimageRuntime}" \
+            -u "gh-releases-zsync|diegopvlk|Cine|latest|*x86_64.AppImage.zsync" \
+            AppDir "$FINAL_APPIMAGE"
+
           cd "$out"
           zsyncmake -u "$(basename "$FINAL_APPIMAGE")" "$FINAL_APPIMAGE"
+
+          runHook postInstall
         '';
-      };
-    in
-      {
-        packages.${system} = {
-          default = appimage;
-          inherit appimage cinePkg;
+
+        meta = with pkgs.lib; {
+          description = "Standalone native FHS AppImage of Cine Video Player";
+          homepage = "https://github.com/diegopvlk/Cine";
+          license = licenses.gpl3Plus;
+          platforms = [ "x86_64-linux" ];
         };
       };
+    in
+    {
+      packages.${system} = {
+        default = appimage;
+        inherit appimage cinePkg;
+      };
+    };
 }
