@@ -98,7 +98,6 @@
         for root_dir in ["AppDir/usr"]:
             for dirpath, _, filenames in os.walk(root_dir):
                 for fname in filenames:
-                    # Never run patchelf on the dynamic linker itself
                     if fname.startswith("ld-linux") or fname.startswith("ld-2."):
                         continue
                     fpath = os.path.join(dirpath, fname)
@@ -137,7 +136,6 @@
           pythonEnv
         ];
 
-        # Omitted pkgs.glibcLocales to save 230+ MB
         closureInfo = pkgs.closureInfo {
           rootPaths = [
             cinePkg
@@ -156,11 +154,15 @@
             pkgs.fribidi.out
             pkgs.librsvg.out
             pkgs.mpv.out
-            pkgs.mesa.out
+            pkgs.mesa.out # Provides libgbm.so.1
             pkgs.libdrm.out
-            pkgs.libva.out
-            pkgs.libglvnd.out
-            pkgs.pulseaudio.out
+            pkgs.libxkbcommon.out
+            pkgs.vulkan-loader.out
+            pkgs.libX11.out
+            pkgs.libXext.out
+            pkgs.libXcursor.out
+            pkgs.libXi.out
+            pkgs.cups.lib
             pkgs.shared-mime-info
             pkgs.gsettings-desktop-schemas
             pkgs.gobject-introspection
@@ -194,7 +196,7 @@
             cp -rL --no-preserve=mode "${pkgs.glibc}/lib/gconv" AppDir/usr/lib/ 2>/dev/null || true
           fi
 
-          # Copy the unwrapped raw Python binary
+          # Copy raw Python binary
           REAL_PY=$(readlink -f "${rawPython}/bin/python3")
           cp -L --no-preserve=mode "$REAL_PY" AppDir/usr/bin/python3
           chmod +x AppDir/usr/bin/python3
@@ -204,16 +206,42 @@
             cp -rL --no-preserve=mode "${rawPython}/lib/"* AppDir/usr/lib/ 2>/dev/null || true
           fi
 
-          find AppDir/usr/lib -type d \( -name "test" -o -name "tests" -o -name "idlelib" -o -name "__pycache__" \) -exec rm -rf {} + 2>/dev/null || true
-          find AppDir/usr/lib -type f -name "*.pyc" -delete 2>/dev/null || true
+          # High-value Python debloat: strip unneeded standard library packages (saves ~40 MB)
+          rm -rf AppDir/usr/lib/python3.*/ensurepip
+          rm -rf AppDir/usr/lib/python3.*/idlelib
+          rm -rf AppDir/usr/lib/python3.*/turtledemo AppDir/usr/lib/python3.*/turtle.py
+          rm -rf AppDir/usr/lib/python3.*/tkinter
+          rm -rf AppDir/usr/lib/python3.*/pydoc_data
+          rm -rf AppDir/usr/lib/python3.*/unittest
+          rm -rf AppDir/usr/lib/python3.*/test AppDir/usr/lib/python3.*/tests
+          find AppDir/usr/lib/python3.* -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find AppDir/usr/lib/python3.* -type f \( -name "*.pyc" -o -name "*.exe" \) -delete 2>/dev/null || true
 
-          # 2. Extract shared libraries and typelibs from the closure
+          # 2. Extract shared libraries: target large GPU hardware drivers & offline models
           while IFS= read -r storePath; do
             case "$storePath" in
-              *linux-headers*|*llvm*|*intel-media-driver*|*-dev) continue ;;
+              # Exclude build tools, kernel headers, heavy dev components, and testing suites
+              *linux-headers*|*llvm*|*intel-media-driver*|*-dev|*gtest*) continue ;;
+              
+              # Exclude offline voice models and broadcast capture hardware drivers
+              *flite*|*ajantv2*) continue ;;
+              
+              # Exclude compiler runtime sanitizers
+              *libasan*|*libtsan*|*libhwasan*|*libubsan*) continue ;;
+
+              # Exclude massive ICU global character databases (saves ~40 MB)
+              *icu*) continue ;;
+
               *)
                 if [ -d "$storePath/lib" ]; then
-                  find -L "$storePath/lib" -maxdepth 2 -type f \( -name "*.so" -o -name "*.so.*" \) ! -path "*/dri/*" -exec cp -f --no-preserve=mode -t AppDir/usr/lib/ {} + 2>/dev/null || true
+                  find -L "$storePath/lib" -maxdepth 2 -type f \( -name "*.so" -o -name "*.so.*" \) \
+                    ! -path "*/dri/*" \
+                    ! -name "*gallium*" \
+                    ! -name "libvulkan_*.so*" \
+                    ! -name "libflite*.so*" \
+                    ! -name "libicudata*.so*" \
+                    ! -name "*asan*.so*" \
+                    -exec cp -f --no-preserve=mode -t AppDir/usr/lib/ {} + 2>/dev/null || true
                 fi
                 if [ -d "$storePath/lib/pulseaudio" ]; then
                   mkdir -p AppDir/usr/lib/pulseaudio
@@ -228,6 +256,14 @@
             esac
           done < "$closureInfo/store-paths"
 
+          # Assert that essential dynamic loaders and libraries are present
+          for req in "libvulkan.so.1" "libcups.so.2" "libdrm.so.2" "libgbm.so.1" "libX11.so.6" "libxkbcommon.so.0" "libSvtAv1Enc.so.4" "libglslang.so.16"; do
+            if [ ! -e "AppDir/usr/lib/$req" ]; then
+              echo "Error: $req was not copied into AppDir/usr/lib!" >&2
+              exit 1
+            fi
+          done
+
           # Create missing short and major version symlinks
           for sofile in AppDir/usr/lib/*.so.*; do
             [ -f "$sofile" ] || continue
@@ -241,6 +277,14 @@
           # 3. Run full ELF sanitization and patching
           python3 ${patchAppDirPy}
           find AppDir/usr/lib -type f -name "mpv.py" -exec sed -i -E 's|"/nix/store/[^"]+/libmpv\.so"|"libmpv.so"|g' {} + 2>/dev/null || true
+
+          # Strip unneeded debug symbols from bundled binaries (skip dynamic linker)
+          find AppDir/usr/bin AppDir/usr/lib -type f -exec file {} + | grep -E "ELF.*(executable|shared object)" | cut -d: -f1 | while read -r elf; do
+            case "$(basename "$elf")" in
+              ld-linux*|ld-2.*) continue ;;
+              *) strip --strip-unneeded "$elf" 2>/dev/null || true ;;
+            esac
+          done
 
           # 4. Configure GDK-Pixbuf loaders and cache
           PIXBUF_LOADERS_DIR=$(find AppDir/usr/lib/gdk-pixbuf-2.0 -type d -name "loaders" 2>/dev/null | head -n 1 || true)
@@ -279,7 +323,6 @@ share_dir = os.path.join(appdir, "usr", "share")
 cine_share = os.path.join(share_dir, "cine")
 localedir = os.path.join(share_dir, "locale")
 
-# 1. Initialize and bind C runtime & Python i18n domains
 try:
     locale.setlocale(locale.LC_ALL, "")
 except Exception:
@@ -298,7 +341,6 @@ for domain in ["cine", "com.github.diegopvlk.Cine", "gtk40", "libadwaita"]:
     gettext.bindtextdomain(domain, localedir)
 gettext.textdomain("cine")
 
-# 2. Preload low-level rendering and font libraries
 for lib in ["libgbm.so.1", "libfreetype.so.6", "libharfbuzz.so.0", "libfontconfig.so.1"]:
     lp = os.path.join(usr_lib, lib)
     if os.path.exists(lp):
@@ -324,7 +366,7 @@ sys.exit(main.main("${cinePkg.version}"))
 EOF
           chmod +x AppDir/usr/bin/cine-entry
 
-          # 8. Generate AppRun entry point (Plan B: dynamic host locale detection)
+          # 8. Generate AppRun entry point (linking with both NixOS & FHS paths)
           cat << 'EOF' > AppDir/AppRun
 #!/usr/bin/env bash
 set -e
@@ -333,7 +375,7 @@ export APPDIR="''${APPDIR:-$(dirname "$(readlink -f "''${BASH_SOURCE[0]}")")}"
 export PATH="$APPDIR/usr/bin:$PATH"
 export PYTHONNOUSERSITE=true
 
-# Plan B: Try host locale-archive first, otherwise fall back to host locale directories
+# Fallback to host locale files
 if [ -z "$LOCALE_ARCHIVE" ]; then
   if [ -f "/usr/lib/locale/locale-archive" ]; then
     export LOCALE_ARCHIVE="/usr/lib/locale/locale-archive"
@@ -342,7 +384,6 @@ if [ -z "$LOCALE_ARCHIVE" ]; then
   fi
 fi
 
-# Fallback for systems with individual locale directories (e.g., Debian/Ubuntu)
 if [ -d "/usr/lib/locale" ]; then
   export LOCPATH="/usr/lib/locale''${LOCPATH:+:$LOCPATH}"
 fi
@@ -361,8 +402,10 @@ export TEXTDOMAINDIR="$APPDIR/usr/share/locale"
 export GSETTINGS_SCHEMA_DIR="$APPDIR/usr/share/glib-2.0/schemas"
 export XDG_DATA_DIRS="$APPDIR/usr/share:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
-# Host GPU driver pass-through
+# Comprehensive GPU driver and display server pass-through paths (NixOS + standard FHS)
 HOST_DRI="/run/opengl-driver/lib/dri:/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri"
+HOST_LIBS="/run/opengl-driver/lib:/run/current-system/sw/lib:/usr/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib"
+
 export LIBVA_DRIVERS_PATH="$HOST_DRI''${LIBVA_DRIVERS_PATH:+:$LIBVA_DRIVERS_PATH}"
 export __EGL_VENDOR_LIBRARY_DIRS="/run/opengl-driver/share/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d:$APPDIR/usr/share/glvnd/egl_vendor.d"
 
@@ -374,13 +417,12 @@ export GI_TYPELIB_PATH="$APPDIR/usr/lib/girepository-1.0"
 export MPV_OPTS="--hwdec=auto-safe --vo=gpu ''${MPV_OPTS:-}"
 
 LOADER="$APPDIR/usr/lib/ld-linux-x86-64.so.2"
-LIB_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/pulseaudio:/run/opengl-driver/lib:/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri"
+LIB_PATH="$APPDIR/usr/lib:$HOST_LIBS"
 
-# Execute python3 using the bundled dynamic linker to fully decouple from the host glibc
 exec "$LOADER" --library-path "$LIB_PATH" "$APPDIR/usr/bin/python3" "$APPDIR/usr/bin/cine-entry" "$@"
 EOF
 
-          # Set proper read, write, and execute permissions across AppDir
+          # Set permissions
           chmod -R u+w AppDir
           chmod +x AppDir/AppRun AppDir/usr/bin/* AppDir/usr/lib/ld-linux-x86-64.so.2
           chmod -R a+rX AppDir
