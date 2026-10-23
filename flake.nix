@@ -154,7 +154,7 @@
             pkgs.fribidi.out
             pkgs.librsvg.out
             pkgs.mpv.out
-            pkgs.mesa.out # Provides libgbm.so.1
+            pkgs.mesa.out
             pkgs.libdrm.out
             pkgs.libxkbcommon.out
             pkgs.vulkan-loader.out
@@ -192,9 +192,6 @@
 
           # Bundle matching glibc runtime and the ld-linux dynamic linker
           cp -fL --no-preserve=mode ${pkgs.glibc}/lib/*.so* AppDir/usr/lib/ 2>/dev/null || true
-          if [ -d "${pkgs.glibc}/lib/gconv" ]; then
-            cp -rL --no-preserve=mode "${pkgs.glibc}/lib/gconv" AppDir/usr/lib/ 2>/dev/null || true
-          fi
 
           # Copy raw Python binary
           REAL_PY=$(readlink -f "${rawPython}/bin/python3")
@@ -206,16 +203,27 @@
             cp -rL --no-preserve=mode "${rawPython}/lib/"* AppDir/usr/lib/ 2>/dev/null || true
           fi
 
-          # High-value Python debloat: strip unneeded standard library packages (saves ~40 MB)
-          rm -rf AppDir/usr/lib/python3.*/ensurepip
-          rm -rf AppDir/usr/lib/python3.*/idlelib
-          rm -rf AppDir/usr/lib/python3.*/turtledemo AppDir/usr/lib/python3.*/turtle.py
-          rm -rf AppDir/usr/lib/python3.*/tkinter
-          rm -rf AppDir/usr/lib/python3.*/pydoc_data
-          rm -rf AppDir/usr/lib/python3.*/unittest
-          rm -rf AppDir/usr/lib/python3.*/test AppDir/usr/lib/python3.*/tests
-          find AppDir/usr/lib/python3.* -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-          find AppDir/usr/lib/python3.* -type f \( -name "*.pyc" -o -name "*.exe" \) -delete 2>/dev/null || true
+          # -------------------------------------------------------------------------
+          # High-Impact Python Debloat: Strip dev files, static archives, and tests
+          # -------------------------------------------------------------------------
+          # (a) Remove 67MB+ static archive and C headers (saves ~70 MB)
+          find AppDir/usr/lib -type d -name "config-3.*" -exec rm -rf {} + 2>/dev/null || true
+          find AppDir/usr/lib -type f -name "*.a" -delete 2>/dev/null || true
+
+          # (b) Remove pip wheels and unused standard library modules (saves ~20 MB)
+          find AppDir/usr/lib -type d \( \
+            -name "ensurepip" -o \
+            -name "idlelib" -o \
+            -name "turtledemo" -o \
+            -name "tkinter" -o \
+            -name "pydoc_data" -o \
+            -name "unittest" -o \
+            -name "test" -o \
+            -name "tests" -o \
+            -name "__pycache__" \
+          \) -exec rm -rf {} + 2>/dev/null || true
+
+          find AppDir/usr/lib -type f \( -name "*.pyc" -o -name "*.exe" -o -name "turtle.py" \) -delete 2>/dev/null || true
 
           # 2. Extract shared libraries: target large GPU hardware drivers & offline models
           while IFS= read -r storePath; do
@@ -223,6 +231,9 @@
               # Exclude build tools, kernel headers, heavy dev components, and testing suites
               *linux-headers*|*llvm*|*intel-media-driver*|*-dev|*gtest*) continue ;;
               
+              # Exclude hardware GPU drivers (handled by host DRI pass-through)
+              *gallium*|*vulkan-headers*) continue ;;
+
               # Exclude offline voice models and broadcast capture hardware drivers
               *flite*|*ajantv2*) continue ;;
               
@@ -232,15 +243,26 @@
               # Exclude massive ICU global character databases (saves ~40 MB)
               *icu*) continue ;;
 
+              # Exclude non-essential codecs (保留 libaom, libx264, xvidcore 等所需库)
+              *openh264*|*libde265*) continue ;;
+
+              # Exclude misc dev utilities and sound fonts (修复：使用 *-sox-* 避免误伤 soxr)
+              *fluidsynth*|*-sox-*|*gettext*) continue ;;
+
               *)
                 if [ -d "$storePath/lib" ]; then
                   find -L "$storePath/lib" -maxdepth 2 -type f \( -name "*.so" -o -name "*.so.*" \) \
                     ! -path "*/dri/*" \
+                    ! -path "*/gstreamer-1.0/*" \
                     ! -name "*gallium*" \
                     ! -name "libvulkan_*.so*" \
                     ! -name "libflite*.so*" \
                     ! -name "libicudata*.so*" \
                     ! -name "*asan*.so*" \
+                    ! -name "*libopenh264*" \
+                    ! -name "*libde265*" \
+                    ! -name "*camera*" \
+                    ! -name "*textstyle*" \
                     -exec cp -f --no-preserve=mode -t AppDir/usr/lib/ {} + 2>/dev/null || true
                 fi
                 if [ -d "$storePath/lib/pulseaudio" ]; then
@@ -257,9 +279,22 @@
           done < "$closureInfo/store-paths"
 
           # Assert that essential dynamic loaders and libraries are present
-          for req in "libvulkan.so.1" "libcups.so.2" "libdrm.so.2" "libgbm.so.1" "libX11.so.6" "libxkbcommon.so.0" "libSvtAv1Enc.so.4" "libglslang.so.16"; do
-            if [ ! -e "AppDir/usr/lib/$req" ]; then
-              echo "Error: $req was not copied into AppDir/usr/lib!" >&2
+          for req in \
+            "libvulkan.so.1" \
+            "libcups.so.2" \
+            "libdrm.so.2" \
+            "libgbm.so.1" \
+            "libX11.so.6" \
+            "libxkbcommon.so.0" \
+            "libSvtAv1Enc.so.*" \
+            "libglslang.so.16" \
+            "libtinysparql-3.0.so.0" \
+            "libaom.so.3" \
+            "libx264.so.*" \
+            "libxvidcore.so.4" \
+            "libsoxr.so.0"; do
+            if [ -z "$(find AppDir/usr/lib -maxdepth 1 -name "$req" -print -quit)" ]; then
+              echo "Error: Critical runtime library $req was not copied into AppDir/usr/lib!" >&2
               exit 1
             fi
           done
@@ -387,8 +422,6 @@ fi
 if [ -d "/usr/lib/locale" ]; then
   export LOCPATH="/usr/lib/locale''${LOCPATH:+:$LOCPATH}"
 fi
-
-[ -d "$APPDIR/usr/lib/gconv" ] && export GCONV_PATH="$APPDIR/usr/lib/gconv"
 
 if [ -n "$LANG" ]; then
   case "$LANG" in
